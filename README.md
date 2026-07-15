@@ -1,36 +1,96 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Intégration eSignet Bénin — Next.js (App Router)
 
-## Getting Started
+Squelette de Relying Party OIDC pour eSignet Bénin, aligné sur le guide ANIP.
+Le navigateur ne reçoit ni clé privée ni logique de validation : tout ce qui est
+sensible vit côté serveur.
 
-First, run the development server:
+## Prérequis
+
+- Next.js 14+ (App Router) et Node.js 18+
+- Un client eSignet de développement **déjà onboardé** avec le callback exact
+  `http://localhost:3000/auth/callback`
+- La paire de clés RSA correspondant à la JWK publique transmise à eSignet
+
+## 1. Générer la paire de clés (prérequis bloquant)
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install jose
+node scripts/generate-keys.mjs
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Produit dans `./keys` :
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- `public.jwk.json` → **à transmettre à l'équipe eSignet**
+- `private.pem` → reste côté serveur, jamais commité
+- `env-snippet.txt` → `ESIGNET_KEY_ID` et `ESIGNET_PRIVATE_KEY` prêts à coller
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Chaque environnement (local / recette / production) a sa **propre** paire.
 
-## Learn More
+## 2. Configurer
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+cp .env.example .env.local
+# puis compléter avec le client-id, le snippet de keys/env-snippet.txt,
+# et un ESIGNET_SESSION_SECRET aléatoire fort
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Générer un secret de session :
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
 
-## Deploy on Vercel
+## 3. Lancer
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+npm ci
+npm run dev
+# Point d'entrée : http://localhost:3000/login
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Arborescence
+
+| Fichier | Rôle |
+|---------|------|
+| `scripts/generate-keys.mjs` | Génère la paire RSA + JWK publique |
+| `components/esignet/sign-in-button.tsx` | Charge le plugin, initialise le bouton |
+| `app/api/auth/esignet/prepare/route.ts` | `state`/`nonce` + cookie de tentative |
+| `app/auth/callback/route.ts` | Orchestration du callback + redirections |
+| `app/api/auth/esignet/logout/route.ts` | Destruction de session |
+| `lib/esignet-auth.ts` | Assertion client, token exchange, validation JWT/JWKS, UserInfo, JWE |
+| `lib/esignet-session.ts` | Lecture de la session (garde serveur) |
+| `lib/esignet-cookies.ts` | Effacement cohérent des cookies |
+| `lib/esignet-types.ts` | Contrat du profil applicatif |
+| `app/dashboard/page.tsx` | Garde serveur avant l'espace privé |
+| `app/login/page.tsx` | Page publique + messages d'état |
+
+## Invariant du callback
+
+L'URI envoyée à `/authorize`, celle envoyée au token endpoint et celle
+enregistrée chez eSignet doivent être **identiques au caractère près**
+(protocole, domaine, port, chemin). C'est la cause n°1 d'échec.
+
+## Matrice de recette (positifs + négatifs)
+
+- `/login` charge le plugin, bouton visible
+- Clic → écran eSignet avec le nom du client ANIP
+- Accès direct `/dashboard` sans session → redirection login
+- Altération du `state` → `invalid_callback`, pas de dashboard
+- Non-partage d'un attribut → « Non partagé », jamais de valeur fictive
+- Déconnexion → les deux cookies expirés
+- Retour arrière après logout → dashboard toujours inaccessible
+
+## Points d'attention eSignet Bénin
+
+- Les attributs métier ne sont pas dans l'ID token : chargés depuis UserInfo.
+- UserInfo peut être **JWS signé** (vérifié via JWKS) ou JSON.
+- `ESIGNET_ALLOW_UNVERIFIED_USERINFO` reste `false` : exception transport
+  temporaire uniquement, à documenter et retirer.
+- `NEXT_PUBLIC_ESIGNET_CLAIMS` vide tant que l'onboarding des claims n'est pas
+  confirmé ; les scopes suffisent à déclencher les claims associés.
+
+## Avant une ouverture à des utilisateurs réels
+
+Le guide ANIP identifie des écarts à fermer : **PKCE S256**, découverte OIDC
+dynamique, résolution formelle de la signature UserInfo, rotation des clés en
+coffre/HSM, tests de charge, revue de confidentialité et homologation sécurité.
