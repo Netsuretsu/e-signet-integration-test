@@ -1,6 +1,3 @@
-// Garde serveur avant rendu de l'espace privé. Aucun accès sur la simple
-// présence d'un paramètre de callback : seule une session valide passe.
-
 import { redirect } from "next/navigation";
 import { getEsignetSession } from "@/lib/esignet-session";
 

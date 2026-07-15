@@ -1,8 +1,5 @@
 "use client";
 
-// Charge le plugin officiel eSignet, prépare une tentative côté serveur, puis
-// initialise le bouton avec la configuration OIDC complète.
-
 import { useEffect, useRef } from "react";
 
 declare global {

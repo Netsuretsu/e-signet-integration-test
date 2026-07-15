@@ -1,5 +1,3 @@
-// Page publique : bouton eSignet + messages d'erreur sûrs (génériques).
-
 import { SignInButton } from "@/components/esignet/sign-in-button";
 
 export const dynamic = "force-dynamic";

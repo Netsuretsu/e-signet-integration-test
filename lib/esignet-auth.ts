@@ -1,10 +1,3 @@
-// Frontière de sécurité principale du Relying Party.
-// Tout ce qui touche aux secrets, à la signature et à la validation des jetons
-// vit ici, côté serveur uniquement. Rien de ce fichier ne doit être importé
-// dans un composant client.
-//
-// Dépendance : jose (npm install jose)
-
 import {
   SignJWT,
   importPKCS8,
@@ -29,16 +22,37 @@ function requireEnv(name: string): string {
   return v;
 }
 
-const CLIENT_ID = requireEnv("ESIGNET_CLIENT_ID");
-const KEY_ID = requireEnv("ESIGNET_KEY_ID");
-const ISSUER = requireEnv("ESIGNET_ISSUER");
-const TOKEN_URL = requireEnv("ESIGNET_TOKEN_URL");
-const USERINFO_URL = requireEnv("ESIGNET_USERINFO_URL");
-const JWKS_URL = requireEnv("ESIGNET_JWKS_URL");
-const PRIVATE_KEY_PEM = requireEnv("ESIGNET_PRIVATE_KEY").replace(/\\n/g, "\n");
-const SESSION_SECRET = requireEnv("ESIGNET_SESSION_SECRET");
-const ALLOW_UNVERIFIED_USERINFO =
-  process.env.ESIGNET_ALLOW_UNVERIFIED_USERINFO === "true";
+type EsignetConfig = {
+  clientId: string;
+  keyId: string;
+  issuer: string;
+  tokenUrl: string;
+  userInfoUrl: string;
+  jwksUrl: string;
+  privateKeyPem: string;
+  sessionSecret: string;
+  allowUnverifiedUserInfo: boolean;
+};
+
+let cachedConfig: EsignetConfig | null = null;
+
+
+function getConfig(): EsignetConfig {
+  if (cachedConfig) return cachedConfig;
+  cachedConfig = {
+    clientId: requireEnv("ESIGNET_CLIENT_ID"),
+    keyId: requireEnv("ESIGNET_KEY_ID"),
+    issuer: requireEnv("ESIGNET_ISSUER"),
+    tokenUrl: requireEnv("ESIGNET_TOKEN_URL"),
+    userInfoUrl: requireEnv("ESIGNET_USERINFO_URL"),
+    jwksUrl: requireEnv("ESIGNET_JWKS_URL"),
+    privateKeyPem: requireEnv("ESIGNET_PRIVATE_KEY").replace(/\\n/g, "\n"),
+    sessionSecret: requireEnv("ESIGNET_SESSION_SECRET"),
+    allowUnverifiedUserInfo:
+      process.env.ESIGNET_ALLOW_UNVERIFIED_USERINFO === "true",
+  };
+  return cachedConfig;
+}
 
 const SESSION_MIN = 5 * 60;
 const SESSION_MAX = 60 * 60;
@@ -46,22 +60,32 @@ const SESSION_MAX = 60 * 60;
 
 let privateKeyPromise: Promise<CryptoKey> | null = null;
 function getPrivateKey() {
-  privateKeyPromise ??= importPKCS8(PRIVATE_KEY_PEM, "RS256");
+  privateKeyPromise ??= importPKCS8(getConfig().privateKeyPem, "RS256");
   return privateKeyPromise;
 }
 
-const remoteJwks = createRemoteJWKSet(new URL(JWKS_URL));
+let jwksResolver: ReturnType<typeof createRemoteJWKSet> | null = null;
+function getJwks() {
+  jwksResolver ??= createRemoteJWKSet(new URL(getConfig().jwksUrl));
+  return jwksResolver;
+}
 
-const sessionKey = createHash("sha256").update(SESSION_SECRET).digest();
-
+let sessionKeyCache: Buffer | null = null;
+function getSessionKey(): Buffer {
+  sessionKeyCache ??= createHash("sha256")
+    .update(getConfig().sessionSecret)
+    .digest();
+  return sessionKeyCache;
+}
 
 async function buildClientAssertion(): Promise<string> {
+  const cfg = getConfig();
   const key = await getPrivateKey();
   return new SignJWT({})
-    .setProtectedHeader({ alg: "RS256", typ: "JWT", kid: KEY_ID })
-    .setIssuer(CLIENT_ID) // iss = client_id
-    .setSubject(CLIENT_ID) // sub = client_id
-    .setAudience(TOKEN_URL) // aud = token endpoint exact
+    .setProtectedHeader({ alg: "RS256", typ: "JWT", kid: cfg.keyId })
+    .setIssuer(cfg.clientId) // iss = client_id
+    .setSubject(cfg.clientId) // sub = client_id
+    .setAudience(cfg.tokenUrl) // aud = token endpoint exact
     .setJti(randomUUID()) // usage unique
     .setIssuedAt()
     .setExpirationTime("5m")
@@ -79,19 +103,21 @@ async function exchangeCode(
   code: string,
   redirectUri: string,
 ): Promise<TokenResponse> {
+  const cfg = getConfig();
   const assertion = await buildClientAssertion();
 
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code,
+    // DOIT être identique à l'URI envoyée à /authorize et enregistrée à l'onboarding.
     redirect_uri: redirectUri,
-    client_id: CLIENT_ID,
+    client_id: cfg.clientId,
     client_assertion_type:
       "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
     client_assertion: assertion,
   });
 
-  const res = await fetch(TOKEN_URL, {
+  const res = await fetch(cfg.tokenUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
@@ -103,7 +129,10 @@ async function exchangeCode(
 
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
-    throw new AuthError("token_exchange", `HTTP ${res.status} ${detail.slice(0, 200)}`);
+    throw new AuthError(
+      "token_exchange",
+      `HTTP ${res.status} ${detail.slice(0, 200)}`,
+    );
   }
   return (await res.json()) as TokenResponse;
 }
@@ -112,12 +141,13 @@ async function validateIdToken(
   idToken: string,
   expectedNonce: string,
 ): Promise<JWTPayload> {
+  const cfg = getConfig();
   let payload: JWTPayload;
   try {
-    const verified = await jwtVerify(idToken, remoteJwks, {
-      issuer: ISSUER,
-      audience: CLIENT_ID,
-      algorithms: ["RS256"],
+    const verified = await jwtVerify(idToken, getJwks(), {
+      issuer: cfg.issuer,
+      audience: cfg.clientId,
+      algorithms: ["RS256"], // n'accepter QUE RS256
     });
     payload = verified.payload;
   } catch (e) {
@@ -134,15 +164,17 @@ async function validateIdToken(
   return payload;
 }
 
+
 type RawClaims = Record<string, unknown>;
 
 async function loadUserInfo(
   accessToken: string,
   idSub: string,
 ): Promise<{ claims: RawClaims; source: ClaimsSource } | null> {
+  const cfg = getConfig();
   let res: Response;
   try {
-    res = await fetch(USERINFO_URL, {
+    res = await fetch(cfg.userInfoUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
       cache: "no-store",
     });
@@ -156,12 +188,14 @@ async function loadUserInfo(
   const contentType = res.headers.get("content-type") ?? "";
   const raw = await res.text();
 
+  // Cas 1 : réponse signée (JWS compact = trois segments base64url).
   const looksLikeJws =
-    contentType.includes("application/jwt") || /^[\w-]+\.[\w-]+\.[\w-]+$/.test(raw.trim());
+    contentType.includes("application/jwt") ||
+    /^[\w-]+\.[\w-]+\.[\w-]+$/.test(raw.trim());
 
   if (looksLikeJws) {
     try {
-      const { payload } = await jwtVerify(raw.trim(), remoteJwks, {
+      const { payload } = await jwtVerify(raw.trim(), getJwks(), {
         algorithms: ["RS256"],
       });
       const claims = payload as RawClaims;
@@ -173,13 +207,19 @@ async function loadUserInfo(
       // La signature ne se vérifie pas avec les clés publiées.
       // On n'accepte le repli transport QUE si l'exception est explicitement autorisée
       // et que l'endpoint est bien sur la même origine HTTPS que l'émetteur.
-      if (ALLOW_UNVERIFIED_USERINFO && sameHttpsOrigin(USERINFO_URL, ISSUER)) {
+      if (
+        cfg.allowUnverifiedUserInfo &&
+        sameHttpsOrigin(cfg.userInfoUrl, cfg.issuer)
+      ) {
         const claims = decodeJwsPayloadUnsafe(raw.trim());
         if (claims && checkContinuity(claims, idSub)) {
           return { claims, source: "userinfo_transport" };
         }
       }
-      throw new AuthError("userinfo_validation", `JWS non vérifiable: ${String(e)}`);
+      throw new AuthError(
+        "userinfo_validation",
+        `JWS non vérifiable: ${String(e)}`,
+      );
     }
   }
 
@@ -194,14 +234,13 @@ async function loadUserInfo(
     }
     if (!checkContinuity(claims, idSub)) return null;
     // Une réponse JSON n'est pas cryptographiquement signée : on la classe en transport.
-    const source: ClaimsSource =
-      ALLOW_UNVERIFIED_USERINFO && sameHttpsOrigin(USERINFO_URL, ISSUER)
-        ? "userinfo_transport"
-        : "userinfo_transport";
-    return { claims, source };
+    return { claims, source: "userinfo_transport" };
   }
 
-  throw new AuthError("userinfo_validation", `Content-Type inattendu: ${contentType}`);
+  throw new AuthError(
+    "userinfo_validation",
+    `Content-Type inattendu: ${contentType}`,
+  );
 }
 
 // Continuité : le sub d'UserInfo doit correspondre à celui de l'ID token.
@@ -220,6 +259,7 @@ function sameHttpsOrigin(a: string, b: string): boolean {
   }
 }
 
+// Décodage NON vérifié du payload d'un JWS. Réservé au mode de compatibilité.
 function decodeJwsPayloadUnsafe(jws: string): RawClaims | null {
   try {
     const [, payload] = jws.split(".");
@@ -229,6 +269,10 @@ function decodeJwsPayloadUnsafe(jws: string): RawClaims | null {
     return null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// 5. Mapping vers le profil applicatif
+// ---------------------------------------------------------------------------
 
 function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() !== "" ? v : undefined;
@@ -250,6 +294,7 @@ function mapProfile(
   userInfo: { claims: RawClaims; source: ClaimsSource } | null,
   expiresAt: number,
 ): EsignetProfile {
+  // On privilégie UserInfo pour les attributs métier, l'ID token comme repli.
   const c: RawClaims = userInfo?.claims ?? {};
   const source: ClaimsSource = userInfo?.source ?? "id_token";
   const subject = String(idPayload.sub);
@@ -285,19 +330,23 @@ function mapProfile(
   };
 }
 
+// ---------------------------------------------------------------------------
+// 6. Session JWE (dir + A256GCM)
+// ---------------------------------------------------------------------------
+
 export async function encryptSession(profile: EsignetProfile): Promise<string> {
   return new EncryptJWT({ profile })
     .setProtectedHeader({ alg: "dir", enc: "A256GCM" })
     .setIssuedAt()
     .setExpirationTime(Math.floor(profile.expiresAt / 1000))
-    .encrypt(sessionKey);
+    .encrypt(getSessionKey());
 }
 
 export async function decryptSession(
   token: string,
 ): Promise<EsignetProfile | null> {
   try {
-    const { payload } = await jwtDecrypt(token, sessionKey);
+    const { payload } = await jwtDecrypt(token, getSessionKey());
     const profile = payload.profile as EsignetProfile | undefined;
     if (!profile || typeof profile.subject !== "string") return null;
     if (profile.expiresAt <= Date.now()) return null;
@@ -307,6 +356,10 @@ export async function decryptSession(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Orchestration complète : appelée par la route de callback.
+// ---------------------------------------------------------------------------
+
 export async function completeAuthentication(params: {
   code: string;
   redirectUri: string;
@@ -314,8 +367,14 @@ export async function completeAuthentication(params: {
 }): Promise<CallbackResult> {
   try {
     const tokens = await exchangeCode(params.code, params.redirectUri);
-    const idPayload = await validateIdToken(tokens.id_token, params.attempt.nonce);
-    const userInfo = await loadUserInfo(tokens.access_token, String(idPayload.sub));
+    const idPayload = await validateIdToken(
+      tokens.id_token,
+      params.attempt.nonce,
+    );
+    const userInfo = await loadUserInfo(
+      tokens.access_token,
+      String(idPayload.sub),
+    );
 
     // Durée de session bornée : on part de expires_in fourni, sinon 1 h, borné [5 min, 1 h].
     const requested = tokens.expires_in ? tokens.expires_in : SESSION_MAX;
@@ -338,15 +397,17 @@ export async function completeAuthentication(params: {
   }
 }
 
+// Durée max de session exposée pour poser le cookie.
 export function sessionMaxAgeSeconds(profile: EsignetProfile): number {
-  return Math.max(
-    1,
-    Math.floor((profile.expiresAt - Date.now()) / 1000),
-  );
+  return Math.max(1, Math.floor((profile.expiresAt - Date.now()) / 1000));
 }
 
+// Erreur interne qui transporte l'étape du pipeline pour la taxonomie des logs.
 class AuthError extends Error {
-  constructor(public stage: string, message: string) {
+  constructor(
+    public stage: string,
+    message: string,
+  ) {
     super(message);
     this.name = "AuthError";
   }
