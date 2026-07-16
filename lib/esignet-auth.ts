@@ -109,7 +109,6 @@ async function exchangeCode(
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code,
-    // DOIT être identique à l'URI envoyée à /authorize et enregistrée à l'onboarding.
     redirect_uri: redirectUri,
     client_id: cfg.clientId,
     client_assertion_type:
@@ -147,14 +146,13 @@ async function validateIdToken(
     const verified = await jwtVerify(idToken, getJwks(), {
       issuer: cfg.issuer,
       audience: cfg.clientId,
-      algorithms: ["RS256"], // n'accepter QUE RS256
+      algorithms: ["RS256"],
     });
     payload = verified.payload;
   } catch (e) {
     throw new AuthError("id_token_validation", String(e));
   }
 
-  // Comparaison stricte du nonce anti-rejeu.
   if (!payload.nonce || payload.nonce !== expectedNonce) {
     throw new AuthError("nonce_validation", "nonce absent ou différent");
   }
@@ -188,7 +186,6 @@ async function loadUserInfo(
   const contentType = res.headers.get("content-type") ?? "";
   const raw = await res.text();
 
-  // Cas 1 : réponse signée (JWS compact = trois segments base64url).
   const looksLikeJws =
     contentType.includes("application/jwt") ||
     /^[\w-]+\.[\w-]+\.[\w-]+$/.test(raw.trim());
@@ -204,9 +201,6 @@ async function loadUserInfo(
       }
       return { claims, source: "userinfo" };
     } catch (e) {
-      // La signature ne se vérifie pas avec les clés publiées.
-      // On n'accepte le repli transport QUE si l'exception est explicitement autorisée
-      // et que l'endpoint est bien sur la même origine HTTPS que l'émetteur.
       if (
         cfg.allowUnverifiedUserInfo &&
         sameHttpsOrigin(cfg.userInfoUrl, cfg.issuer)
@@ -223,8 +217,6 @@ async function loadUserInfo(
     }
   }
 
-  // Cas 2 : réponse JSON en clair. On exige un transport HTTPS de confiance
-  // et la continuité du sujet.
   if (contentType.includes("application/json")) {
     let claims: RawClaims;
     try {
@@ -233,7 +225,6 @@ async function loadUserInfo(
       throw new AuthError("userinfo_validation", "JSON invalide");
     }
     if (!checkContinuity(claims, idSub)) return null;
-    // Une réponse JSON n'est pas cryptographiquement signée : on la classe en transport.
     return { claims, source: "userinfo_transport" };
   }
 
@@ -243,7 +234,6 @@ async function loadUserInfo(
   );
 }
 
-// Continuité : le sub d'UserInfo doit correspondre à celui de l'ID token.
 function checkContinuity(claims: RawClaims, idSub: string): boolean {
   const sub = typeof claims.sub === "string" ? claims.sub : undefined;
   return !!sub && sub === idSub;
@@ -259,7 +249,6 @@ function sameHttpsOrigin(a: string, b: string): boolean {
   }
 }
 
-// Décodage NON vérifié du payload d'un JWS. Réservé au mode de compatibilité.
 function decodeJwsPayloadUnsafe(jws: string): RawClaims | null {
   try {
     const [, payload] = jws.split(".");
@@ -270,10 +259,7 @@ function decodeJwsPayloadUnsafe(jws: string): RawClaims | null {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 5. Mapping vers le profil applicatif
-// ---------------------------------------------------------------------------
-
+// Mapping vers le profil applicatif
 function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() !== "" ? v : undefined;
 }
@@ -294,7 +280,6 @@ function mapProfile(
   userInfo: { claims: RawClaims; source: ClaimsSource } | null,
   expiresAt: number,
 ): EsignetProfile {
-  // On privilégie UserInfo pour les attributs métier, l'ID token comme repli.
   const c: RawClaims = userInfo?.claims ?? {};
   const source: ClaimsSource = userInfo?.source ?? "id_token";
   const subject = String(idPayload.sub);
@@ -330,10 +315,7 @@ function mapProfile(
   };
 }
 
-// ---------------------------------------------------------------------------
 // 6. Session JWE (dir + A256GCM)
-// ---------------------------------------------------------------------------
-
 export async function encryptSession(profile: EsignetProfile): Promise<string> {
   return new EncryptJWT({ profile })
     .setProtectedHeader({ alg: "dir", enc: "A256GCM" })
@@ -356,10 +338,7 @@ export async function decryptSession(
   }
 }
 
-// ---------------------------------------------------------------------------
 // Orchestration complète : appelée par la route de callback.
-// ---------------------------------------------------------------------------
-
 export async function completeAuthentication(params: {
   code: string;
   redirectUri: string;
